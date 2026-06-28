@@ -131,16 +131,26 @@ import {
   writeCachedPricing
 } from "./lib/pricing";
 import {
-  activityFeedSignature,
-  notificationActionView,
-  serializeState,
-  type TrayView
+activityFeedSignature,
+notificationActionView,
+safeTrayViewForMode,
+serializeState,
+shouldShowCodexNudge,
+type TrayView
 } from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
+import { localOnlyModeEnabled } from "./lib/localMode";
+import {
+  deriveSwitchboardMode,
+  switchboardModeLabel,
+  switchboardModeSummary
+} from "./lib/switchboardDisplay";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { LauncherShell } from "./components/LauncherShell";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { TermsGate } from "./components/TermsGate";
+import { SwitchboardPanel } from "./components/SwitchboardPanel";
+import { SwitchboardDoctorPanel } from "./components/SwitchboardDoctorPanel";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -152,8 +162,9 @@ import type {
   ClientConnectorStatus,
   ClientSetupResult,
   DailySavingsPoint,
-  DashboardState,
-  HeadroomLearnPrereqStatus,
+DashboardState,
+DoctorReport,
+HeadroomLearnPrereqStatus,
   HeadroomLearnStatus,
   HeadroomSubscriptionTier,
   ActivityFeedResponse,
@@ -163,6 +174,8 @@ import type {
   RuntimeStatus,
   RuntimeUpgradeFailure,
   RuntimeUpgradeProgress,
+  SwitchboardMode,
+  SwitchboardState,
 } from "./lib/types";
 
 interface NavItem {
@@ -1091,8 +1104,15 @@ export default function App() {
   const [contactEmail, setContactEmail] = useState("");
   const [contactMessage, setContactMessage] = useState("");
   const [contactSubmitBusy, setContactSubmitBusy] = useState(false);
-  const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
-  const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
+const [contactSubmitError, setContactSubmitError] = useState<string | null>(null);
+const [contactSubmitSuccess, setContactSubmitSuccess] = useState<string | null>(null);
+const [switchboardState, setSwitchboardState] = useState<SwitchboardState | null>(null);
+const [switchboardModeBusy, setSwitchboardModeBusy] = useState<SwitchboardMode | null>(null);
+const [switchboardModeError, setSwitchboardModeError] = useState<string | null>(null);
+const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+const [doctorRepairBusy, setDoctorRepairBusy] = useState<string | null>(null);
+const [doctorRepairError, setDoctorRepairError] = useState<string | null>(null);
+const localOnlyMode = localOnlyModeEnabled();
   const appSemver = appUpdateConfig?.currentVersion ?? packageJson.version;
   const bootstrapFailureSignatureRef = useRef("");
   const mainWindowLastBlurAtRef = useRef<number | null>(null);
@@ -1106,6 +1126,7 @@ export default function App() {
   const dashboardSignatureRef = useRef(serializeState(mockDashboard));
   const connectorsSignatureRef = useRef(serializeState([] as ClientConnectorStatus[]));
   const runtimeStatusSignatureRef = useRef(serializeState(null as RuntimeStatus | null));
+  const switchboardSignatureRef = useRef(serializeState(null as SwitchboardState | null));
   const claudeProjectsSignatureRef = useRef(serializeState([] as ClaudeCodeProject[]));
   const upgradePlansState = getUpgradePlans(
     pricingAudience,
@@ -1168,6 +1189,10 @@ export default function App() {
   }, [runtimeStatus]);
 
   useEffect(() => {
+    switchboardSignatureRef.current = serializeState(switchboardState);
+  }, [switchboardState]);
+
+  useEffect(() => {
     claudeProjectsSignatureRef.current = serializeState(claudeProjects);
   }, [claudeProjects]);
 
@@ -1198,6 +1223,15 @@ export default function App() {
     setRuntimeStatus(next);
   }
 
+  function applySwitchboardStateIfChanged(next: SwitchboardState | null) {
+    const nextSignature = serializeState(next);
+    if (switchboardSignatureRef.current === nextSignature) {
+      return;
+    }
+    switchboardSignatureRef.current = nextSignature;
+    setSwitchboardState(next);
+  }
+
   function applyClaudeProjectsIfChanged(next: ClaudeCodeProject[]) {
     const nextSignature = serializeState(next);
     if (claudeProjectsSignatureRef.current === nextSignature) {
@@ -1217,15 +1251,21 @@ export default function App() {
           return;
         }
         const view = notificationActionView(action);
-        if (view) {
-          setActiveView(view);
-        }
+if (view) {
+setActiveView(safeTrayViewForMode(view, localOnlyMode));
+}
       }
     );
     return () => {
       void unlistenPromise.then((unlisten) => unlisten());
     };
-  }, []);
+}, [localOnlyMode]);
+
+  useEffect(() => {
+    if (localOnlyMode && (activeView === "upgrade" || activeView === "upgradeAuth")) {
+      setActiveView("home");
+    }
+  }, [activeView, localOnlyMode]);
 
   useEffect(() => {
     setShowAllUpgradePlans(false);
@@ -1245,6 +1285,10 @@ export default function App() {
 
   useEffect(() => {
     const STORAGE_KEY = "headroom:lastNotifiedMismatchTier";
+    if (localOnlyMode) {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return;
+    }
     const mismatch = pricingStatus?.tierMismatch;
     if (!mismatch) {
       window.localStorage.removeItem(STORAGE_KEY);
@@ -1264,7 +1308,7 @@ export default function App() {
       body: `Your ${sourceLabel} usage needs the Headroom ${recommendedLabel} plan, above your current ${paidLabel} plan. Upgrade to keep unlimited optimization.`,
     }).catch(() => {});
     window.localStorage.setItem(STORAGE_KEY, mismatch.recommendedTier);
-  }, [pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
+  }, [localOnlyMode, pricingStatus?.tierMismatch?.recommendedTier, pricingStatus?.tierMismatch]);
 
   useEffect(() => {
     const claudeConnector = getClaudeConnector(connectors);
@@ -1362,9 +1406,13 @@ export default function App() {
       }
 
       updateStartup("runtime", 80, "Preparing Headroom runtime…");
-      const [runtimeResult, pricingResult] = await Promise.all([
-        invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
-        invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
+const [runtimeResult, switchboardResult, doctorResult, pricingResult] = await Promise.all([
+invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
+invoke<SwitchboardState>("get_switchboard_state").catch(() => null),
+invoke<DoctorReport>("get_doctor_report").catch(() => null),
+localOnlyMode
+? Promise.resolve(null)
+: invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
         refreshConnectors(),
       ]);
       if (!active) {
@@ -1373,7 +1421,13 @@ export default function App() {
       if (runtimeResult) {
         applyRuntimeStatusIfChanged(runtimeResult);
       }
-      if (pricingResult) {
+if (switchboardResult) {
+applySwitchboardStateIfChanged(switchboardResult);
+}
+if (doctorResult) {
+setDoctorReport(doctorResult);
+}
+if (pricingResult) {
         setPricingStatus(pricingResult);
       }
 
@@ -1397,7 +1451,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [localOnlyMode]);
 
   useEffect(() => {
     if (startupReady) {
@@ -1785,6 +1839,19 @@ export default function App() {
   }, [appUpdateConfig, startupReady, windowLabel]);
 
   useEffect(() => {
+    if (windowLabel !== "main" || !trayWindowFocused) {
+      return;
+    }
+void refreshSwitchboardState();
+void refreshDoctorReport();
+const interval = window.setInterval(() => {
+void refreshSwitchboardState();
+void refreshDoctorReport();
+}, 5_000);
+    return () => window.clearInterval(interval);
+  }, [trayWindowFocused, windowLabel]);
+
+  useEffect(() => {
     appUpdateKnownVersionRef.current = appUpdateAvailable?.version ?? null;
   }, [appUpdateAvailable?.version]);
 
@@ -1834,7 +1901,7 @@ export default function App() {
     setAddonResult(null);
     try {
       await invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled });
-      await refreshRuntimeStatus();
+      await refreshSwitchboardState();
       const message = nextEnabled ? undefined : copy?.disabled;
       if (message) {
         setAddonResult({ id: "rtk", message });
@@ -2149,6 +2216,9 @@ export default function App() {
   }, [anyConnectorEnabled]);
 
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     // Pricing status hits the remote Headroom API. When the tray is focused,
     // poll at 60s so fresh subscription/trial state is visible on demand.
     // When hidden, slow to 10 min — still fast enough for trial-expiry and
@@ -2163,7 +2233,7 @@ export default function App() {
     return () => {
       window.clearInterval(interval);
     };
-  }, [trayWindowFocused]);
+  }, [localOnlyMode, trayWindowFocused]);
 
   // headroom:// deep links from the backend trigger an immediate pricing
   // refresh — the typical case is Polar's checkout success page redirecting
@@ -2171,6 +2241,9 @@ export default function App() {
   // just pulls the new status into UI state without waiting for the next
   // poll tick.
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     let unlisten: (() => void) | undefined;
     void listen("pricing-refreshed", () => {
       void refreshPricingStatus();
@@ -2178,13 +2251,16 @@ export default function App() {
       unlisten = fn;
     });
     return () => unlisten?.();
-  }, []);
+  }, [localOnlyMode]);
 
   // After the user opens a Polar checkout URL, poll pricing status every 5s
   // for up to 5 minutes so we can flip the UI back to "active" within seconds
   // of payment confirmation, instead of waiting out the 60s baseline cadence.
   // Auto-stops once subscription_active is observed or the window expires.
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     if (checkoutPollingDeadline === null) return;
     if (Date.now() > checkoutPollingDeadline) {
       setCheckoutPollingDeadline(null);
@@ -2200,20 +2276,26 @@ export default function App() {
     return () => {
       window.clearInterval(interval);
     };
-  }, [checkoutPollingDeadline]);
+  }, [checkoutPollingDeadline, localOnlyMode]);
 
   // Stop the aggressive checkout poll the moment we observe a live
   // subscription. Saves traffic and stops competing with the 60s cadence.
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     if (checkoutPollingDeadline !== null && pricingStatus?.account?.subscriptionActive) {
       setCheckoutPollingDeadline(null);
     }
-  }, [checkoutPollingDeadline, pricingStatus?.account?.subscriptionActive]);
+  }, [checkoutPollingDeadline, localOnlyMode, pricingStatus?.account?.subscriptionActive]);
 
   // When the pricing gate closes, pause optimization on every enabled
   // connector (not just Claude Code) one at a time. Each disable refreshes
   // `connectors`, re-running this effect until none remain enabled.
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     if (!pricingStatus || pricingStatus.optimizationAllowed || connectorsBusy) {
       return;
     }
@@ -2223,7 +2305,7 @@ export default function App() {
     }
     autoDisabledByGateRef.current.add(target.clientId);
     void toggleConnector(target, false);
-  }, [connectors, connectorsBusy, pricingStatus]);
+  }, [connectors, connectorsBusy, localOnlyMode, pricingStatus]);
 
   // Companion to the auto-disable effect above: when the pricing gate
   // releases (e.g., user just signed up post-grace, or weekly usage
@@ -2231,6 +2313,9 @@ export default function App() {
   // a manual re-enable click. Scoped to our own prior auto-disables so a
   // user's manual disable during an ungated period is preserved.
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     if (!pricingStatus?.optimizationAllowed || autoDisabledByGateRef.current.size === 0) {
       return;
     }
@@ -2246,9 +2331,12 @@ export default function App() {
       return;
     }
     void toggleConnector(target, true);
-  }, [connectors, connectorsBusy, pricingStatus]);
+  }, [connectors, connectorsBusy, localOnlyMode, pricingStatus]);
 
   useEffect(() => {
+    if (localOnlyMode) {
+      return;
+    }
     const runtimeHealthyNow =
       runtimeStatus?.running === true &&
       runtimeStatus?.proxyReachable === true &&
@@ -2262,7 +2350,7 @@ export default function App() {
       .catch(() => {
         desktopActivationSentRef.current = false;
       });
-  }, [connectorPhase, pricingStatus?.authenticated, runtimeStatus?.proxyReachable, runtimeStatus?.running]);
+  }, [connectorPhase, localOnlyMode, pricingStatus?.authenticated, runtimeStatus?.proxyReachable, runtimeStatus?.running]);
 
   // While verifying, poll the proxy's /stats request counter and flip to
   // healthy when it ticks past the anchor we captured on the first reachable
@@ -2569,7 +2657,65 @@ export default function App() {
     }
   }
 
-  async function refreshRuntimeStatus() {
+async function refreshSwitchboardState() {
+try {
+const state = await invoke<SwitchboardState>("get_switchboard_state");
+applySwitchboardStateIfChanged(state);
+applyRuntimeStatusIfChanged(state.runtime);
+applyConnectorsIfChanged(state.clients);
+} catch {
+applySwitchboardStateIfChanged(null);
+}
+}
+
+async function refreshDoctorReport() {
+try {
+const report = await invoke<DoctorReport>("get_doctor_report");
+setDoctorReport(report);
+} catch {
+setDoctorReport(null);
+}
+}
+
+async function handleSetSwitchboardMode(mode: SwitchboardMode) {
+if (switchboardModeBusy !== null) {
+return;
+}
+setSwitchboardModeBusy(mode);
+setSwitchboardModeError(null);
+try {
+const state = await invoke<SwitchboardState>("set_switchboard_mode", { mode });
+applySwitchboardStateIfChanged(state);
+applyRuntimeStatusIfChanged(state.runtime);
+applyConnectorsIfChanged(state.clients);
+await refreshDoctorReport();
+} catch (error) {
+setSwitchboardModeError(
+error instanceof Error ? error.message : "Could not switch optimization mode."
+);
+} finally {
+setSwitchboardModeBusy(null);
+}
+}
+
+async function handleDoctorRepair(action: string) {
+if (doctorRepairBusy !== null) {
+return;
+}
+setDoctorRepairBusy(action);
+setDoctorRepairError(null);
+try {
+const report = await invoke<DoctorReport>("run_doctor_repair", { action });
+setDoctorReport(report);
+await refreshSwitchboardState();
+} catch (error) {
+setDoctorRepairError(error instanceof Error ? error.message : "Could not run repair.");
+} finally {
+setDoctorRepairBusy(null);
+}
+}
+
+async function refreshRuntimeStatus() {
     try {
       const runtime = await invoke<RuntimeStatus>("get_runtime_status");
       applyRuntimeStatusIfChanged(runtime);
@@ -2588,9 +2734,10 @@ export default function App() {
     setResuming(true);
     setResumeError(null);
     try {
-      await invoke("force_restart_headroom");
-      await refreshRuntimeStatus();
-    } catch (error) {
+await invoke("force_restart_headroom");
+await refreshRuntimeStatus();
+await refreshDoctorReport();
+} catch (error) {
       setResumeError(
         error instanceof Error ? error.message : "Could not restart Headroom."
       );
@@ -2600,6 +2747,11 @@ export default function App() {
   }
 
   async function refreshPricingStatus() {
+    if (localOnlyMode) {
+      setPricingBusy(false);
+      setPricingError(null);
+      return;
+    }
     if (pricingRefreshInFlightRef.current) {
       return;
     }
@@ -2839,8 +2991,8 @@ export default function App() {
     }
   }
 
-  function openUpgradeAuthView(planId: UpgradePlanId | null = null) {
-    setActiveView("upgradeAuth");
+function openUpgradeAuthView(planId: UpgradePlanId | null = null) {
+setActiveView(safeTrayViewForMode("upgradeAuth", localOnlyMode));
     setPendingUpgradePlanId(planId);
     setAuthFlowError(null);
     setAuthFlowSuccess(null);
@@ -2898,7 +3050,7 @@ export default function App() {
       setAuthCodeRequestedFor(null);
       setAuthFlowSuccess("Headroom account connected.");
       setPendingUpgradePlanId(null);
-      setActiveView("upgrade");
+setActiveView(safeTrayViewForMode("upgrade", localOnlyMode));
       await refreshConnectors();
     } catch (error) {
       setAuthFlowError(describeInvokeError(error, "Could not verify sign-in code."));
@@ -4117,21 +4269,21 @@ export default function App() {
       } as const;
     }
 
-    if (pricingStatus?.needsAuthentication) {
+    if (!localOnlyMode && pricingStatus?.needsAuthentication) {
       return {
         tone: "degraded",
         title: pricingStatus.gateMessage
       } as const;
     }
 
-    if (pricingStatus && !pricingStatus.optimizationAllowed) {
+    if (!localOnlyMode && pricingStatus && !pricingStatus.optimizationAllowed) {
       return {
         tone: "disabled",
         title: pricingStatus.gateMessage
       } as const;
     }
 
-    if (pricingStatus?.shouldNudge) {
+    if (!localOnlyMode && pricingStatus?.shouldNudge) {
       return {
         tone: "starting",
         title: pricingStatus.gateMessage
@@ -4141,7 +4293,7 @@ export default function App() {
     // Codex-only gate: surface in the top banner only when the Claude side isn't
     // itself gating/nudging (handled above), so mixed users never get a double
     // banner. Codex billing/pausing is scoped to Codex traffic.
-    const codexUsage = pricingStatus?.codex;
+    const codexUsage = localOnlyMode ? null : pricingStatus?.codex;
     if (codexUsage && codexUsage.optimizationAllowed === false) {
       return {
         tone: "disabled",
@@ -4206,7 +4358,40 @@ export default function App() {
           }
           return `Headroom needs attention: ${primaryIssue}.`;
         })();
-  const tierMismatch = pricingStatus?.tierMismatch ?? null;
+  const tierMismatch = localOnlyMode ? null : pricingStatus?.tierMismatch ?? null;
+  const switchboardConnectors = sortClientConnectors(aggregateClientConnectors(connectors));
+  const enabledSwitchboardConnectors = switchboardConnectors.filter((connector) => connector.enabled);
+  const derivedSwitchboardMode: SwitchboardMode = deriveSwitchboardMode(
+    runtimeStatus,
+    enabledSwitchboardConnectors
+  );
+  const switchboardMode = switchboardState?.mode ?? derivedSwitchboardMode;
+  const switchboardModeCopy =
+    switchboardState?.summary ?? switchboardModeSummary(switchboardMode);
+  const switchboardRtkLabel = runtimeStatus?.rtk.installed
+    ? runtimeStatus.rtk.enabled
+      ? "Enabled"
+      : "Installed, off"
+    : "Not installed";
+  const switchboardProxyStatus =
+    runtimeStatus?.running && runtimeStatus.proxyReachable
+      ? "Running"
+      : runtimeStatus?.paused
+        ? "Paused"
+        : "Offline";
+  const switchboardRtkDetail =
+    rtkAvgSavingsPct !== null
+      ? `${percent1(rtkAvgSavingsPct)}% average savings`
+      : "Shell output compression";
+  const switchboardHeadroomLabel =
+    (switchboardState?.enabledClients ?? enabledSwitchboardConnectors).length > 0
+      ? (switchboardState?.enabledClients ?? enabledSwitchboardConnectors)
+          .map((connector) => connector.name)
+          .join(", ")
+      : "No clients enabled";
+  const switchboardLocalOnly = switchboardState?.localOnly ?? localOnlyMode;
+  const switchboardRemoteServicesEnabled =
+    switchboardState?.remoteServicesEnabled ?? !switchboardLocalOnly;
   const sortedClaudeProjects = [...claudeProjects].sort((left, right) => {
     const leftTime = Date.parse(left.lastWorkedAt);
     const rightTime = Date.parse(right.lastWorkedAt);
@@ -4502,13 +4687,15 @@ export default function App() {
           ))}
         </nav>
         <div className="tray-sidebar__footer">
-          <button
-            className={`upgrade-pill${activeView === "upgrade" || activeView === "upgradeAuth" ? " is-active" : ""}`}
-            onMouseDown={() => setActiveView("upgrade")}
-            type="button"
-          >
-            Upgrade
-          </button>
+          {!localOnlyMode ? (
+            <button
+              className={`upgrade-pill${activeView === "upgrade" || activeView === "upgradeAuth" ? " is-active" : ""}`}
+              onMouseDown={() => setActiveView("upgrade")}
+              type="button"
+            >
+              Upgrade
+            </button>
+          ) : null}
           <button
             className={`tray-nav__item${activeView === "settings" ? " is-active" : ""}`}
             onMouseDown={() => setActiveView("settings")}
@@ -4615,12 +4802,8 @@ export default function App() {
               const codexConnector = aggregateClientConnectors(connectors).find(
                 (connector) => connector.clientId === "codex"
               );
-              const showCodexNudge =
-                !codexNudgeDismissed &&
-                !!codexConnector &&
-                codexConnector.installed &&
-                !codexConnector.enabled &&
-                pricingStatus?.optimizationAllowed !== false;
+const showCodexNudge =
+shouldShowCodexNudge(codexConnector, pricingStatus, codexNudgeDismissed, localOnlyMode);
               if (!showCodexNudge || !codexConnector) {
                 return null;
               }
@@ -4653,7 +4836,33 @@ export default function App() {
               );
             })()}
 
-            <section className="stat-grid stat-grid--2col">
+            <SwitchboardPanel
+              mode={switchboardMode}
+              summary={switchboardModeCopy}
+              localOnly={switchboardLocalOnly}
+              proxyStatus={switchboardProxyStatus}
+              headroomDetail={switchboardHeadroomLabel}
+              rtkStatus={switchboardRtkLabel}
+              rtkDetail={switchboardRtkDetail}
+remoteServicesEnabled={switchboardRemoteServicesEnabled}
+paused={runtimeStatus?.paused === true}
+resuming={resuming}
+modeBusy={switchboardModeBusy}
+modeError={switchboardModeError}
+onSetMode={(mode) => void handleSetSwitchboardMode(mode)}
+onResume={() => void handleResumeRuntime()}
+onManageClients={() => setActiveView("settings")}
+onManageRtk={() => setActiveView("addons")}
+/>
+
+<SwitchboardDoctorPanel
+report={doctorReport}
+busyAction={doctorRepairBusy}
+error={doctorRepairError}
+onRepair={(action) => void handleDoctorRepair(action)}
+/>
+
+<section className="stat-grid stat-grid--2col">
               <article
                 className={`soft-card stat-card stat-card--clickable${chartMode === "usd" ? " is-active" : ""}`}
                 onClick={() => setChartMode("usd")}
